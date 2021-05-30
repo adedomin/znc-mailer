@@ -70,45 +70,35 @@ using std::string;
 
 struct curl_reader_data
 {
-    size_t len;
     size_t cursor;
-    char *data;
+    std::string data;
 
-    curl_reader_data(std::string body)
+    curl_reader_data(std::string &&body) : cursor(0), data(body)
     {
-        // We don't care about the NUL
-        this->len = body.length();
-        this->cursor = 0;
-        this->data = new char[this->len];
-        memcpy(this->data, body.c_str(), this->len);
-    }
-
-    ~curl_reader_data()
-    {
-        delete[] this->data;
     }
 };
 
 static size_t curl_reader(char *read_dest, size_t size_dest, size_t num_items, void *myctx)
 {
     auto email_body = (curl_reader_data *)myctx;
-    auto read_dest_max = size_dest * num_items;
+    const size_t read_dest_max = size_dest * num_items;
 
     if (read_dest_max < 1)
-        return 0;
-
-    if (email_body->cursor < email_body->len)
     {
-        size_t offset = email_body->cursor;
-        size_t max_len = email_body->len - offset;
-        size_t read_len = read_dest_max < max_len ? read_dest_max : max_len;
-        char *data = &(email_body->data[offset]);
+        return 0;
+    }
+    else if (email_body->cursor < email_body->data.length())
+    {
+        const size_t offset = email_body->cursor;
+        const size_t max_len = email_body->data.length() - offset;
+        const size_t read_len = read_dest_max < max_len ? read_dest_max : max_len;
+        const char *data = email_body->data.c_str() + offset;
         memcpy(read_dest, data, read_len);
         email_body->cursor += read_len;
         return read_len;
     }
-
-    return 0;
+    else
+        return 0;
 }
 
 class CMailerMod : public CModule
@@ -153,7 +143,7 @@ class CMailerMod : public CModule
         user = GetUser();
         network = GetNetwork();
 
-        // Condition strings
+        // Condition language. TODO: consider removing this.
         defaults["channel_conditions"] = "all";
         defaults["query_conditions"] = "all";
 
@@ -161,7 +151,7 @@ class CMailerMod : public CModule
         defaults["away_only"] = "no";
         defaults["client_count_less_than"] = "1";
         defaults["highlight"] = "";
-        defaults["highlight_suffix"] = ": ; ,";
+        defaults["highlight_suffix"] = " :;,";
         defaults["idle"] = "0";
         defaults["last_active"] = "0";
         defaults["last_notification"] = "0";
@@ -169,10 +159,14 @@ class CMailerMod : public CModule
         defaults["replied"] = "no";
 
         // Notification Settings
-        defaults["address_to"] = "root@localhost";
-        defaults["address_from"] = "znc@localhost";
+        defaults["address_to"] = "<root@localhost>";
+        defaults["address_from"] = "<znc@localhost>";
         defaults["smtp_server_url"] = "smtp://localhost:25";
+        // SMTP Auth
+        defaults["smtp_username"] = "";
+        defaults["smtp_password"] = "";
     }
+
     virtual ~CMailerMod()
     {
     }
@@ -207,19 +201,32 @@ class CMailerMod : public CModule
         return ctx_buf;
     }
 
+    CString get_local_time_str(const char *format)
+    {
+        const time_t now = time(nullptr);
+        struct tm timeinfo = {};
+
+        localtime_r(&now, &timeinfo);
+
+        // just to be safe.
+        char date_time[128] = {};
+        const size_t len = strftime(date_time, sizeof(date_time), format, &timeinfo);
+        return CString(date_time, len);
+    }
+
     void add_message_ctx(const CString &context, const CString &nick, const CString &msg)
     {
         auto msg_ctx = get_notification_ctx(context);
         if (msg_ctx != nullptr)
         {
-            CString mesg;
-            mesg = "<" + nick + "> " + msg;
+            CString mesg = get_local_time_str("[%Y-%m-%d %T%z]");
+            mesg += " <" + nick + "> " + msg;
             msg_ctx->push_back(mesg);
         }
     }
 
     /**
-     * Send a message to the currently-configured Notifo account.
+     * Send a message to the currently-configured email.
      * Requires (and assumes) that the user has already configured their
      * username and API secret using the 'set' command.
      *
@@ -233,28 +240,22 @@ class CMailerMod : public CModule
     {
         auto ctx_buf = get_notification_ctx(context);
 
-        std::stringstream ctx_bstream;
+        auto ctx_body = CString();
         if (ctx_buf != nullptr) {
-            for (CString &msg : *ctx_buf)
+            for (const CString &msg : *ctx_buf)
             {
-                ctx_bstream << msg << "\r\n";
+                ctx_body += msg + "\r\n";
             }
         }
-        auto ctx_body = ctx_bstream.str();
 
-        // Generate an ISO8601 date string
-        time_t rawtime = {};
-        struct tm *timeinfo = {};
-        // Set the last notification time
-        last_notification_time[context] = time(&rawtime);
-        timeinfo = localtime(&rawtime);
-        char date_time[128] = {};
-        strftime(date_time, sizeof(date_time), "%a, %d %b %Y %T %z (%Z)", timeinfo);
+        CString date_time = get_local_time_str("%a, %d %b %Y %T %z (%Z)");
 
         // Email config.
         CString to = options["address_to"];
         CString from = options["address_from"];
         CString smtp_server = options["smtp_server_url"];
+        CString username = options["smtp_username"];
+        CString password = options["smtp_password"];
 
         std::thread mailer_task([=]()->void {
             CURL *curl = curl_easy_init();
@@ -262,16 +263,23 @@ class CMailerMod : public CModule
             {
                 curl_easy_setopt(curl, CURLOPT_URL, smtp_server.c_str());
                 curl_easy_setopt(curl, CURLOPT_MAIL_FROM, from.c_str());
+                if (username.length() != 0 && password.length() != 0)
+                {
+                    curl_easy_setopt(curl, CURLOPT_USERNAME, username.c_str());
+                    curl_easy_setopt(curl, CURLOPT_PASSWORD, password.c_str());
+                }
 
                 struct curl_slist *recipients = nullptr;
                 recipients = curl_slist_append(recipients, to.c_str());
                 curl_easy_setopt(curl, CURLOPT_MAIL_RCPT, recipients);
 
                 std::stringstream body;
-                body << "Date: " << date_time << "\r\n"
-                     << "To: " << to << "\r\n"
+                body << "To: " << to << "\r\n"
                      << "From: " << from << "\r\n"
-                     << "Subject: " << network->GetName() << " - " << context << " from " << from_nick << "\r\n"
+                     << "Date: " << date_time << "\r\n"
+                     << "Subject: "
+                         << network->GetName() << " - "
+                         << context << " from " << from_nick << "\r\n"
                      << "\r\n"
                      << "Message: " << message << "\r\n"
                      << "Context:\r\n"
@@ -466,7 +474,7 @@ class CMailerMod : public CModule
         VCString values;
         options["highlight"].Split(" ", values, false);
 
-        for (CString& hl : values)
+        for (const CString &hl : values)
         {
             CString value = hl.AsLower();
             char prefix = value[0];
@@ -490,12 +498,11 @@ class CMailerMod : public CModule
             }
         }
 
-        VCString suffix;
-        options["highlight_suffix"].Split(" ", suffix, false);
+        auto suffix = options["highlight_suffix"];
         CString nick = network->GetIRCNick().GetNick();
 
-        if (suffix.size()) {
-            for (CString& s: suffix)
+        if (suffix.length() != 0) {
+            for (const char &s: suffix)
             {
                 auto concat = nick+s;
                 if (message.find(concat) != string::npos)
@@ -562,7 +569,7 @@ class CMailerMod : public CModule
 
         CString name = nick.GetNick().AsLower();
 
-        for (auto& ignore : blacklist)
+        for (const auto &ignore : blacklist)
         {
             if (name.WildCmp(ignore.AsLower()))
             {
@@ -637,7 +644,7 @@ class CMailerMod : public CModule
      */
     bool OnLoad(const CString &args, CString &message)
     {
-        for (const auto& [key, value] : defaults)
+        for (const auto &[key, value] : defaults)
         {
             CString user_value = GetNV(key);
             options[key] = user_value == "" ? value : user_value;
@@ -939,7 +946,7 @@ class CMailerMod : public CModule
                 table.AddColumn("Option");
                 table.AddColumn("Value");
 
-                for(auto& [key, value] : options)
+                for (const auto &[key, value] : options)
                 {
                     table.AddRow();
                     table.SetCell("Option", key);
@@ -1029,7 +1036,8 @@ class CMailerMod : public CModule
             add_message_ctx("*mailer", "*mailer", message);
             send_message(message, "*mailer", "*mailer");
         }
-        else if (action == "test-hl") {
+        else if (action == "test-hl")
+        {
             CString message = command.Token(1, true, " ", true);
             if (highlight(message))
             {
@@ -1059,4 +1067,3 @@ class CMailerMod : public CModule
 };
 
 MODULEDEFS(CMailerMod, "Send highlights and personal messages to a given E-Mail address.")
-
