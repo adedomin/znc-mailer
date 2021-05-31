@@ -10,17 +10,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
-option(BUNDLED_DEP "Use Bundled OpenSSL, cURL and Boost." OFF)
-if (BUNDLED_DEP)
-    set(BUNDLED_DEP_PREFIX "Path to bundled output" "build_bundled/output")
-    list(INSERT CMAKE_PREFIX_PATH 0 ${BUNDLED_DEP_PREFIX})
-endif()
-
-find_package(CURL REQUIRED COMPONENTS SMTP)
-set(Boost_USE_STATIC_LIBS   ON)  # only find static libs
-set(Boost_USE_DEBUG_LIBS    OFF) # ignore debug libs and
-set(Boost_USE_RELEASE_LIBS  ON)  # only find release libs
-set(Boost_USE_MULTITHREADED OFF)
+find_package(CURL REQUIRED COMPONENTS SMTP SMTPS)
 find_package(Boost REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(ZNC znc)
@@ -28,11 +18,11 @@ pkg_check_modules(ZNC znc)
 # Detect if ZNC's pkg-config definition is broken.
 # If it is broken, read the LIBS= defined in the znc-buildmod shellscript.
 list(LENGTH ZNC_LIBRARIES LIB_LEN)
-if (${LIB_LEN} EQUAL 0)
+if(${LIB_LEN} EQUAL 0)
     find_program(ZNC_BUILDMOD
         NAMES znc-buildmod
     )
-    if("${ZNC_BUILDMOD}" EQUAL "ZNC_BUILDMOD-NOTFOUND")
+    if("${ZNC_BUILDMOD}" STREQUAL "ZNC_BUILDMOD-NOTFOUND")
         message(FATAL_ERROR "Could not find znc-buildmod utility")
     endif()
 
@@ -56,9 +46,11 @@ target_include_directories(${PROJECT_NAME}
 target_compile_options(${PROJECT_NAME}
     PRIVATE ${ZNC_CFLAGS}
 )
+set_target_properties(${PROJECT_NAME} PROPERTIES PREFIX "")
 
+# Provide ~znc as the prefix.
 install(TARGETS ${PROJECT_NAME}
-    DESTINATION lib/
+    DESTINATION ".znc/modules/"
     PERMISSIONS
         OWNER_READ OWNER_WRITE OWNER_EXECUTE
         GROUP_READ GROUP_EXECUTE

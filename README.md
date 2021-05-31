@@ -4,19 +4,22 @@ Tool to send email on highlight
 
 ## Dependencies
 
-cURL  - (SMTP Feature)
+cURL \w SMTP(S)
+
 Boost
-ZNC
+
+ZNC Development headers + znc-buildmod script.
 
 
 ## Build
 
 ```
 mkdir build
-cmake ..
-# Don't bother parallelizing
+# you could also use `getent passwd znc | cut -d: -f6`
+cmake -DCMAKE_INSTALL_PREFIX="$(printf %s ~znc)"..
+# Do not bother parallelizing; one compilation unit.
 cmake --build .
-cp lib/libmailer.so ~znc/.znc/modules/mailer.so
+cmake --install .
 ```
 
 ## Config

@@ -68,6 +68,46 @@ using std::string;
 
 #define CTX_SIZE 10
 
+static const CString USAGE = CString(
+    "HELP:\n\n"
+    "get [option]     - Prints all options or the option specified.\n"
+    "set option value - Set the given option to a given value; prints the new value.\n"
+    "append option value  - Append the given value to an existing option.\n"
+    "prepend option value - Prepend the given value to an existing option.\n"
+    "unset option     - Return the option to the default value.\n"
+    "\nDEBUG HELP:\n\n"
+    "send [anything] - Will attempt to send an email with the message being the one given and the context "
+    "being the module.\n"
+    "test-hl [anything] - Tests if the given message would result in a valid matching message.\n"
+    "test-ignore nick - Tests if a given nickname would highlight.\n"
+    "\nSETTINGS:\n\n"
+    "Notification conditions:\n"
+    "NOTE: All of these conditions must either be unset or they all must be true.\n"
+    "away_only - Send notification only if you are explicitly away - default: no (disabled)\n"
+    "client_count_less_than - Send notification only if there is less than - default: 1\n"
+    "                         *n* number of clients connected for your nick.\n"
+    "highlight - Additional strings to match for in a given message. - default: UNSET\n"
+    "              1) If the match is prefixed with *-* it will ignore the message if it matches.\n"
+    "              2) If the match is prefixed with *_* it will only match the whole word.\n"
+    "                 For instance: _car will only match car, not racecar or cart.\n"
+    "highlight_suffix - Suffixes that must be in front of your nick to match. - default: :;,\n"
+    "idle - Time in seconds you have to be idle to receive an email - default: 0 (disabled).\n"
+    "last_active - Time in seconds since you last sent a message/action before receiving an email. - default: 0 "
+    "(disabled).\n"
+    "last_notification - Time since you were last notified, before you receive another one - default: 0 (disabled).\n"
+    "nick_blacklist - space separated list of nicknames to ignore, can have simple glob (*) pattern. - default UNSET.\n"
+    "replied - ??? - default: no (disabled).\n"
+    "\nSMTP Options:\n\n"
+    "NOTE: EMAIL ADDRESSES CANNOT CONTAIN DESCRIPTIVE NAMES: e.g. \"My Name\" <me@my.tld>\n"
+    "address_to   - The intended receiver of emails. - default: <root@localhost>\n"
+    "address_from - The envelope FROM.               - default: <znc@localhost>\n"
+    "smtp_server_url - The server address as a URI.  - default: smtp://localhost:25\n"
+    "                  Use smtps:// for TLS. Make sure to use explicit TLS port (465).\n"
+    "                  STARTTLS (587) is untested."
+    "SMTP Authentication (SASL Plain):\n"
+    "smtp_username - username - default UNSET\n"
+    "smtp_password - password - default UNSET");
+
 struct curl_reader_data
 {
     size_t cursor;
@@ -75,6 +115,23 @@ struct curl_reader_data
 
     curl_reader_data(std::string &&body) : cursor(0), data(body)
     {
+    }
+
+    size_t remaining_size()
+    {
+        return data.length() - cursor;
+    }
+
+    size_t copy_up_to(char *dest, const size_t limit)
+    {
+        auto max_len = remaining_size();
+        if (max_len == 0) return 0;
+        auto lim = limit <= max_len ? limit : max_len;
+        auto target = data.c_str() + cursor;
+
+        memcpy(dest, target, lim);
+        cursor += lim;
+        return lim;
     }
 };
 
@@ -87,15 +144,9 @@ static size_t curl_reader(char *read_dest, size_t size_dest, size_t num_items, v
     {
         return 0;
     }
-    else if (email_body->cursor < email_body->data.length())
+    else if (email_body->remaining_size() > 0)
     {
-        const size_t offset = email_body->cursor;
-        const size_t max_len = email_body->data.length() - offset;
-        const size_t read_len = read_dest_max < max_len ? read_dest_max : max_len;
-        const char *data = email_body->data.c_str() + offset;
-        memcpy(read_dest, data, read_len);
-        email_body->cursor += read_len;
-        return read_len;
+        return email_body->copy_up_to(read_dest, read_dest_max);
     }
     else
         return 0;
@@ -143,15 +194,11 @@ class CMailerMod : public CModule
         user = GetUser();
         network = GetNetwork();
 
-        // Condition language. TODO: consider removing this.
-        defaults["channel_conditions"] = "all";
-        defaults["query_conditions"] = "all";
-
         // Notification conditions
         defaults["away_only"] = "no";
         defaults["client_count_less_than"] = "1";
         defaults["highlight"] = "";
-        defaults["highlight_suffix"] = " :;,";
+        defaults["highlight_suffix"] = ":;,";
         defaults["idle"] = "0";
         defaults["last_active"] = "0";
         defaults["last_notification"] = "0";
@@ -238,6 +285,7 @@ class CMailerMod : public CModule
                       const CString &context = "*mailer",
                       const CString &from_nick = "*mailer")
     {
+        last_notification_time[context] = time(nullptr);
         auto ctx_buf = get_notification_ctx(context);
 
         auto ctx_body = CString();
@@ -308,126 +356,6 @@ class CMailerMod : public CModule
         return true;
     }
 
-    /**
-     * Evaluate a boolean expression using condition values.
-     * All tokens must be separated by spaces, using "and" and "or" for
-     * boolean operators, "(" and ")" to enclose sub-expressions, and
-     * condition option names to evaluate each condition.
-     *
-     * @param expression Boolean expression string
-     * @param context Notification context
-     * @param nick Sender nick
-     * @param message Message contents
-     * @return Result of boolean evaluation
-     */
-    bool eval(const CString &expression, const CString &context = CString(""), const CNick &nick = CNick(""),
-              const CString &message = " ")
-    {
-        CString padded = expression.Replace_n("(", " ( ");
-        padded.Replace(")", " ) ");
-
-        VCString tokens;
-        padded.Split(" ", tokens, false);
-
-        PutDebug("Evaluating message: <" + nick.GetNick() + "> " + message);
-        bool result = eval_tokens(tokens.begin(), tokens.end(), context, nick, message);
-
-        return result;
-    }
-
-#define expr(x, y)                                                                                                     \
-    else if (token == x)                                                                                               \
-    {                                                                                                                  \
-        bool result = y;                                                                                               \
-        dbg += CString(x) + "/" + CString(result ? "true" : "false") + " ";                                            \
-        value = oper ? value && result : value || result;                                                              \
-    }
-
-    /**
-     * Evaluate a tokenized boolean expression, or sub-expression.
-     *
-     * @param pos Token vector iterator current position
-     * @param end Token vector iterator end position
-     * @param context Notification context
-     * @param nick Sender nick
-     * @param message Message contents
-     * @return Result of boolean expression
-     */
-    bool eval_tokens(VCString::iterator pos, VCString::iterator end, const CString &context, const CNick &nick,
-                     const CString &message)
-    {
-        bool oper = true;
-        bool value = true;
-
-        CString dbg = "";
-
-        for (; pos != end; pos++)
-        {
-            CString token = pos->AsLower();
-
-            if (token == "(")
-            {
-                // recursively evaluate sub-expressions
-                bool inner = eval_tokens(++pos, end, context, nick, message);
-                dbg += "( inner/" + CString(inner ? "true" : "false") + " ) ";
-                value = oper ? value && inner : value || inner;
-
-                // search ahead to the matching parenthesis token
-                unsigned int parens = 1;
-                while (pos != end)
-                {
-                    if (*pos == "(")
-                    {
-                        parens++;
-                    }
-                    else if (*pos == ")")
-                    {
-                        parens--;
-                    }
-
-                    if (parens == 0)
-                    {
-                        break;
-                    }
-
-                    pos++;
-                }
-            }
-            else if (token == ")")
-            {
-                pos++;
-                PutDebug(dbg);
-                return value;
-            }
-            else if (token == "and")
-            {
-                dbg += "and ";
-                oper = true;
-            }
-            else if (token == "or")
-            {
-                dbg += "or ";
-                oper = false;
-            }
-
-            expr("true", true) expr("false", false) expr("away_only", away_only())
-                expr("client_count_less_than", client_count_less_than()) expr("highlight", highlight(message))
-                    expr("idle", idle()) expr("last_active", last_active(context))
-                        expr("last_notification", last_notification(context))
-                            expr("nick_blacklist", nick_blacklist(nick)) expr("replied", replied(context))
-
-                                else
-            {
-                PutModule("Error: Unexpected token \"" + token + "\"");
-            }
-        }
-
-        PutDebug(dbg);
-        return value;
-    }
-
-#undef expr
-
   protected:
     /**
      * Check if the away status condition is met.
@@ -480,11 +408,15 @@ class CMailerMod : public CModule
             char prefix = value[0];
             bool notify = true;
 
+            // TODO: make this like _ as well?
+            // Negate match
             if (prefix == '-')
             {
                 notify = false;
                 value.LeftChomp(1);
             }
+            // Find whole word by itself
+            // _car matches car, but not cart or racecar.
             else if (prefix == '_')
             {
                 value = " " + value.LeftChomp_n(1) + " ";
@@ -499,23 +431,19 @@ class CMailerMod : public CModule
         }
 
         auto suffix = options["highlight_suffix"];
-        CString nick = network->GetIRCNick().GetNick();
+        CString nick = " " + network->GetIRCNick().GetNick().AsLower();
 
         if (suffix.length() != 0) {
             for (const char &s: suffix)
             {
                 auto concat = nick+s;
-                if (message.find(concat) != string::npos)
+                if (msg.find(concat) != string::npos)
                     return true;
             }
-            return false;
         }
-        else if (message.find(nick) != string::npos)
-        {
-            return true;
-        }
-        else
-            return false;
+
+        // Else find nickname as a word.
+        return msg.find(nick + " ") != string::npos;
     }
 
     /**
@@ -540,7 +468,9 @@ class CMailerMod : public CModule
     {
         unsigned int value = options["last_active"].ToUInt();
         unsigned int now = time(NULL);
-        return value == 0 || last_active_time.count(context) < 1 || last_active_time[context] + value < now;
+        return value == 0 ||
+            last_active_time.find(context) == last_active_time.end() ||
+            last_active_time[context] + value < now;
     }
 
     /**
@@ -553,7 +483,9 @@ class CMailerMod : public CModule
     {
         unsigned int value = options["last_notification"].ToUInt();
         unsigned int now = time(NULL);
-        return value == 0 || last_notification_time.count(context) < 1 || last_notification_time[context] + value < now;
+        return value == 0 ||
+            last_notification_time.find(context) == last_notification_time.end() ||
+            last_notification_time[context] + value < now;
     }
 
     /**
@@ -589,7 +521,8 @@ class CMailerMod : public CModule
     bool replied(const CString &context)
     {
         CString value = options["replied"].AsLower();
-        return value != "yes" || last_notification_time[context] == 0 ||
+        return value != "yes" ||
+            last_notification_time[context] == 0 ||
                last_notification_time[context] < last_reply_time[context];
     }
 
@@ -604,13 +537,6 @@ class CMailerMod : public CModule
     bool notify_channel(const CNick &nick, const CChan &channel, const CString &message)
     {
         CString context = channel.GetName();
-
-        CString expression = options["channel_conditions"].AsLower();
-        if (expression != "all")
-        {
-            return eval(expression, context, nick, message);
-        }
-
         return away_only() && client_count_less_than() && highlight(message) && idle() && last_active(context) &&
                last_notification(context) && nick_blacklist(nick) && replied(context) && true;
     }
@@ -624,13 +550,6 @@ class CMailerMod : public CModule
     bool notify_pm(const CNick &nick, const CString &message)
     {
         CString context = nick.GetNick();
-
-        CString expression = options["query_conditions"].AsLower();
-        if (expression != "all")
-        {
-            return eval(expression, context, nick, message);
-        }
-
         return away_only() && client_count_less_than() && idle() && last_active(context) &&
                last_notification(context) && nick_blacklist(nick) && replied(context) && true;
     }
@@ -847,14 +766,6 @@ class CMailerMod : public CModule
             }
             else
             {
-                if (option == "channel_conditions" || option == "query_conditions")
-                {
-                    if (value != "all")
-                    {
-                        eval(value);
-                    }
-                }
-
                 options[option] = value;
                 options[option].Trim();
                 SetNV(option, options[option]);
@@ -938,8 +849,7 @@ class CMailerMod : public CModule
                 PutModule("Usage: get [<option>]");
                 return;
             }
-
-            if (token_count < 2)
+            else if (token_count < 2)
             {
                 CTable table;
 
@@ -956,17 +866,19 @@ class CMailerMod : public CModule
                 PutModule(table);
                 return;
             }
-
-            CString option = tokens[1].AsLower();
-            MCString::iterator pos = options.find(option);
-
-            if (pos == options.end())
-            {
-                PutModule("Error: invalid option name");
-            }
             else
             {
-                PutModule(option + CString(": \"") + options[option] + CString("\""));
+                CString option = tokens[1].AsLower();
+                MCString::iterator pos = options.find(option);
+
+                if (pos == options.end())
+                {
+                    PutModule("Error: invalid option name");
+                }
+                else
+                {
+                    PutModule(option + CString(": \"") + options[option] + CString("\""));
+                }
             }
         }
         // STATUS command
@@ -1036,28 +948,59 @@ class CMailerMod : public CModule
             add_message_ctx("*mailer", "*mailer", message);
             send_message(message, "*mailer", "*mailer");
         }
-        else if (action == "test-hl")
+        else if (action == "test")
         {
-            CString message = command.Token(1, true, " ", true);
-            if (highlight(message))
+            if (token_count < 2)
             {
-                PutModule("Would Email.");
+                PutModule(
+                    "usage: test highlight [message]\n"
+                    "       test ignore nick\n"
+                );
+            }
+            if (tokens[1] == "highlight")
+            {
+                CString message = command.Token(2, true, " ", true);
+                if (highlight(message))
+                {
+                    PutModule("Would Email.");
+                }
+                else
+                {
+                    PutModule("No Match.");
+                }
+            }
+            else if (tokens[1] == "ignore")
+            {
+                if (token_count != 3)
+                {
+                    PutModule("No nick given.\n");
+                }
+                else {
+                    auto nickstr = tokens[2];
+                    auto nick = CNick(nickstr);
+
+                    if (nick_blacklist(nick))
+                    {
+                        PutModule("Is not ignored.");
+                    }
+                    else
+                    {
+                        PutModule("Is ignored.");
+                    }
+                }
             }
             else
             {
-                PutModule("No Match.");
+                PutModule(
+                    "usage: test highlight [message]\n"
+                    "       test ignore nick"
+                );
             }
         }
         // HELP command
         else if (action == "help")
         {
-            PutModule("To be written.");
-        }
-        // EVAL command
-        else if (action == "eval")
-        {
-            CString value = command.Token(1, true, " ");
-            PutModule(eval(value) ? "true" : "false");
+            PutModule(USAGE);
         }
         else
         {
